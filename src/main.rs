@@ -1,3 +1,4 @@
+use clap::{Parser, Subcommand};
 use comfy_table::{Cell, Color, Table};
 use std::{
     collections::{HashMap, HashSet},
@@ -297,45 +298,29 @@ impl App {
     }
 }
 
-fn usage() -> ! {
-    println!("usage: haste <command> <args>\n");
-    println!("Available commands:");
-    println!("  haste bench|b");
-    println!("    run rebench and store the results into a new datum.");
-    println!("    the rebench config file must be `$PWD/rebench.conf`\n");
-    println!("  haste diff|d <base-id> <diff-id>");
-    println!("    compare two datums");
-    process::exit(1);
+#[derive(Parser)]
+#[command(version, about, subcommand_required = true)]
+struct Cli {
+    #[command(subcommand)]
+    mode: Mode,
 }
 
-fn parse_id(args: &mut std::iter::Skip<env::Args>) -> Result<usize, ()> {
-    let Some(arg) = args.next() else {
-        return Err(());
-    };
-    let Ok(ret) = arg.parse::<usize>() else {
-        return Err(());
-    };
-    Ok(ret)
+#[derive(Subcommand, Debug)]
+enum Mode {
+    /// Run rebench and store the results into a new datum.
+    /// The rebench config `$PWD/rebench.conf` is used.
+    #[clap(visible_alias = "b")]
+    Bench,
+    /// Compare two datums.
+    #[clap(visible_alias = "d")]
+    Diff { id1: usize, id2: usize },
 }
 
 fn main() {
     let app = App::new();
-
-    let mut args = env::args().skip(1);
-    let Some(mode) = args.next() else { usage() };
-
-    match mode.as_str() {
-        "b" | "bench" => {
-            if args.next().is_some() {
-                usage();
-            }
-            app.cmd_bench()
-        }
-        "d" | "diff" => {
-            let id1 = parse_id(&mut args).unwrap_or_else(|_| usage());
-            let id2 = parse_id(&mut args).unwrap_or_else(|_| usage());
-            app.cmd_diff(id1, id2);
-        }
-        _ => usage(),
+    let cli = Cli::parse();
+    match cli.mode {
+        Mode::Bench => app.cmd_bench(),
+        Mode::Diff { id1, id2 } => app.cmd_diff(id1, id2),
     }
 }
