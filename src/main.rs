@@ -1,4 +1,6 @@
+use clap::{Parser, Subcommand};
 use comfy_table::{Cell, Color, Table};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     env, fmt, fs,
@@ -6,6 +8,12 @@ use std::{
     path::{Path, PathBuf},
     process,
 };
+
+/// The `extra.toml` file for a datum
+#[derive(Default, Serialize, Deserialize)]
+struct ExtraToml {
+    comment: Option<String>,
+}
 
 /// The name of the hidden directory we store state inside.
 const DOT_DIR: &str = ".haste";
@@ -36,7 +44,10 @@ struct ResultFile {
 
 impl ResultFile {
     fn new(p: &Path) -> Self {
-        let f = fs::File::open(p).unwrap();
+        let f = fs::File::open(p).unwrap_or_else(|_| {
+            eprintln!("Couldn't open results file {}", p.to_str().unwrap());
+            std::process::exit(1);
+        });
         let rdr = BufReader::new(f);
         let mut first = true;
         let mut col_indices = HashMap::new();
@@ -206,11 +217,18 @@ impl App {
     }
 
     /// Store a new datum and return the ID.
-    fn store_datum(&self) -> usize {
+    fn store_datum(&self, comment: Option<String>) -> usize {
         let id = self.next_id();
-        fs::create_dir(self.get_datum_dir(id)).unwrap();
+        let datum_dir = self.get_datum_dir(id);
+        fs::create_dir(&datum_dir).unwrap();
         let copy_to = self.get_datum_results_path(id);
         fs::rename("benchmark.data", copy_to).unwrap();
+
+        // Write out the extra metadata.
+        let extra_data = toml::to_string(&ExtraToml { comment }).unwrap();
+        let extra_path = self.get_datum_extra_path(id);
+        std::fs::write(extra_path, extra_data).unwrap();
+
         id
     }
 
@@ -224,10 +242,25 @@ impl App {
         p
     }
 
+    fn get_datum_extra_path(&self, id: usize) -> PathBuf {
+        let mut p = self.get_datum_dir(id);
+        p.push("extra.toml");
+        p
+    }
+
+    fn load_extra(&self, id: usize) -> ExtraToml {
+        let path = self.get_datum_extra_path(id);
+        if let Ok(data) = std::fs::read_to_string(path) {
+            toml::from_str(&data).unwrap()
+        } else {
+            ExtraToml::default()
+        }
+    }
+
     /// Run benchmarks and store the results as a new datum.
     ///
     /// If successful, the new datum is printed to stdout.
-    fn cmd_bench(&self) {
+    fn cmd_bench(&self, comment: Option<String>) {
         let mut cmd = process::Command::new("rebench");
         cmd.args(["-c", "--no-denoise", "rebench.conf"]);
 
@@ -242,8 +275,14 @@ impl App {
             eprintln!("error: benchmark command exited non-zero!");
             process::exit(1)
         }
-        let id = self.store_datum();
-        println!("haste: created datum {id}");
+        let id = self.store_datum(comment.to_owned());
+
+        let comment_s = if let Some(c) = comment {
+            &format!("[{c}]")
+        } else {
+            ""
+        };
+        println!("haste: created datum {id} {comment_s}");
     }
 
     fn cmd_diff(&self, id1: usize, id2: usize) {
@@ -293,49 +332,76 @@ impl App {
         for (_, row) in rows {
             table.add_row(row);
         }
+
+        // If there's any extra metadata, print it.
+        let extra1 = self.load_extra(id1);
+        let extra2 = self.load_extra(id2);
+        if extra1.comment.is_some() || extra2.comment.is_some() {
+            let no_comment = "(no comment)".to_owned();
+            println!(
+                "Datum{id1}: {}",
+                extra1.comment.unwrap_or(no_comment.clone())
+            );
+            println!("Datum{id2}: {}\n", extra2.comment.unwrap_or(no_comment));
+        }
+
         println!("{table}");
+    }
+
+    fn cmd_list(&self) {
+        let mut ids = Vec::new();
+        for ent in fs::read_dir(&self.state_dir).unwrap() {
+            let ent = ent.unwrap();
+            if let Ok(id) = ent
+                .path()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .parse::<usize>()
+            {
+                ids.push(id);
+            }
+        }
+        ids.sort();
+        for id in ids {
+            let extra = self.load_extra(id);
+            println!("{id:3}: {}", extra.comment.unwrap_or("".into()));
+        }
     }
 }
 
-fn usage() -> ! {
-    println!("usage: haste <command> <args>\n");
-    println!("Available commands:");
-    println!("  haste bench|b");
-    println!("    run rebench and store the results into a new datum.");
-    println!("    the rebench config file must be `$PWD/rebench.conf`\n");
-    println!("  haste diff|d <base-id> <diff-id>");
-    println!("    compare two datums");
-    process::exit(1);
+#[derive(Parser)]
+#[command(version, about, subcommand_required = true)]
+struct Cli {
+    #[command(subcommand)]
+    mode: Mode,
 }
 
-fn parse_id(args: &mut std::iter::Skip<env::Args>) -> Result<usize, ()> {
-    let Some(arg) = args.next() else {
-        return Err(());
-    };
-    let Ok(ret) = arg.parse::<usize>() else {
-        return Err(());
-    };
-    Ok(ret)
+#[derive(Subcommand, Debug)]
+enum Mode {
+    /// Run rebench and store the results into a new datum.
+    /// The rebench config `$PWD/rebench.conf` is used.
+    #[clap(visible_alias = "b")]
+    Bench {
+        /// Attach a comment to the datum.
+        #[clap(short, long, num_args(1))]
+        comment: Option<String>,
+    },
+    /// Compare two datums.
+    #[clap(visible_alias = "d")]
+    Diff { id1: usize, id2: usize },
+    /// List datums.
+    #[clap(visible_alias = "l")]
+    List,
 }
 
 fn main() {
     let app = App::new();
-
-    let mut args = env::args().skip(1);
-    let Some(mode) = args.next() else { usage() };
-
-    match mode.as_str() {
-        "b" | "bench" => {
-            if args.next().is_some() {
-                usage();
-            }
-            app.cmd_bench()
-        }
-        "d" | "diff" => {
-            let id1 = parse_id(&mut args).unwrap_or_else(|_| usage());
-            let id2 = parse_id(&mut args).unwrap_or_else(|_| usage());
-            app.cmd_diff(id1, id2);
-        }
-        _ => usage(),
+    let cli = Cli::parse();
+    match cli.mode {
+        Mode::Bench { comment } => app.cmd_bench(comment),
+        Mode::Diff { id1, id2 } => app.cmd_diff(id1, id2),
+        Mode::List => app.cmd_list(),
     }
 }
