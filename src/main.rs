@@ -44,7 +44,10 @@ struct ResultFile {
 
 impl ResultFile {
     fn new(p: &Path) -> Self {
-        let f = fs::File::open(p).unwrap();
+        let f = fs::File::open(p).unwrap_or_else(|_| {
+            eprintln!("Couldn't open results file {}", p.to_str().unwrap());
+            std::process::exit(1);
+        });
         let rdr = BufReader::new(f);
         let mut first = true;
         let mut col_indices = HashMap::new();
