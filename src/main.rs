@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use comfy_table::{Cell, Color, Table};
 use serde::{Deserialize, Serialize};
+use std::process::Command;
 use std::{
     collections::{HashMap, HashSet},
     env, fmt, fs,
@@ -261,7 +262,14 @@ impl App {
     ///
     /// If successful, the new datum is printed to stdout.
     fn cmd_bench(&self, comment: Option<String>) {
-        let mut cmd = process::Command::new("rebench");
+        if Command::new("rebench").arg("--version").output().is_err() {
+            eprintln!(
+                "error: `rebench` binary not found or not executable. Please ensure it is installed and in your PATH."
+            );
+            process::exit(1);
+        }
+
+        let mut cmd = Command::new("rebench");
         cmd.args(["-c", "--no-denoise", "rebench.conf"]);
 
         let Ok(mut child) = cmd.spawn() else {
