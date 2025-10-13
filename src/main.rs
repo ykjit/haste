@@ -37,6 +37,17 @@ impl fmt::Display for BenchKey {
     }
 }
 
+#[allow(dead_code)]
+struct BenchStats {
+    mean: f64,
+    std_dev: f64,
+    min: f64,
+    max: f64,
+    median: f64,
+    confidence_interval: (f64, f64),
+    n_samples: usize,
+}
+
 /// Rebench data file parser.
 #[derive(Debug)]
 struct ResultFile {
@@ -72,6 +83,13 @@ impl ResultFile {
                 first = false;
             } else {
                 let row = l.split_whitespace().collect::<Vec<&str>>();
+
+                // Skip non-total measurements (we only care about total time, not user/sys)
+                if col_indices.contains_key("criterion") {
+                    if row[col_indices["criterion"]] != "total" {
+                        continue;
+                    }
+                }
 
                 // extract the columns we care about.
                 let benchmark = row[col_indices["benchmark"]].to_owned();
@@ -163,16 +181,134 @@ impl ResultFile {
     ///
     /// Returns a HashMap mapping each benchmark key to an arithmetic mean wallclock time for one
     /// iteration.
-    fn summarise(&self) -> HashMap<BenchKey, f64> {
+    fn summarise(&self) -> HashMap<BenchKey, BenchStats> {
         let mut summary = HashMap::new();
         for (k, invocs) in &self.data {
             let mut invoc_means: Vec<f64> = Vec::new();
             for invoc in invocs {
                 invoc_means.push(invoc.iter().sum::<f64>() / invoc.len() as f64);
             }
+
+            let n = invoc_means.len();
+            let mean = invoc_means.iter().sum::<f64>() / n as f64;
+
+            // Calculate std dev of invocation means
+            let variance = invoc_means.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64;
+            let std_dev = variance.sqrt();
+
+            // Calculate min and max
+            let min = invoc_means.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max = invoc_means
+                .iter()
+                .cloned()
+                .fold(f64::NEG_INFINITY, f64::max);
+
+            // Calculate median
+            let mut sorted = invoc_means.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median = if n % 2 == 0 {
+                (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+            } else {
+                sorted[n / 2]
+            };
+
+            // Total samples (all measurements)
+            let n_samples = invocs.iter().map(|inv| inv.len()).sum();
+
+            // For confidence interval, use t-distribution approximation
+            let t_value = if n >= 30 { 1.96 } else { 2.0 };
+            let margin = t_value * std_dev / (n as f64).sqrt();
+            let confidence_interval = (mean - margin, mean + margin);
+
             summary.insert(
                 k.to_owned(),
-                invoc_means.iter().sum::<f64>() / invoc_means.len() as f64,
+                BenchStats {
+                    mean,
+                    std_dev,
+                    min,
+                    max,
+                    median,
+                    confidence_interval,
+                    n_samples,
+                },
+            );
+        }
+        summary
+    }
+
+    /// Produce flat-mean summary statistics for each benchmark.
+    ///
+    /// This flattens all measurements (across invocations and iterations)
+    /// and calculates comprehensive statistics, similar to multitime's approach.
+    fn summarise_flat(&self) -> HashMap<BenchKey, BenchStats> {
+        let mut summary = HashMap::new();
+        for (k, invocs) in &self.data {
+            // Flatten all measurements
+            let mut all_values: Vec<f64> = Vec::new();
+            for invoc in invocs {
+                all_values.extend(invoc.iter().cloned());
+            }
+
+            let n = all_values.len();
+            if n == 0 {
+                continue;
+            }
+
+            // Calculate mean
+            let mean = all_values.iter().sum::<f64>() / n as f64;
+
+            // Calculate standard deviation
+            let variance = all_values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64;
+            let std_dev = variance.sqrt();
+
+            // Calculate min and max
+            let min = all_values.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max = all_values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+            // Calculate median
+            let mut sorted = all_values.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median = if n % 2 == 0 {
+                (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+            } else {
+                sorted[n / 2]
+            };
+
+            // Calculate 95% confidence interval using t-distribution approximation
+            // For large samples, t-distribution approaches normal distribution
+            let t_value = if n >= 30 {
+                1.96
+            } else {
+                // Approximate t-values for small samples at 95% confidence
+                match n {
+                    1 => 12.706,
+                    2 => 4.303,
+                    3 => 3.182,
+                    4 => 2.776,
+                    5 => 2.571,
+                    6 => 2.447,
+                    7 => 2.365,
+                    8 => 2.306,
+                    9 => 2.262,
+                    10 => 2.228,
+                    _ if n < 20 => 2.1, // Approximate for 11-19
+                    _ => 2.0,           // Approximate for 20-29
+                }
+            };
+            let margin = t_value * std_dev / (n as f64).sqrt();
+            let confidence_interval = (mean - margin, mean + margin);
+
+            summary.insert(
+                k.to_owned(),
+                BenchStats {
+                    mean,
+                    std_dev,
+                    min,
+                    max,
+                    median,
+                    confidence_interval,
+                    n_samples: n,
+                },
             );
         }
         summary
@@ -261,6 +397,64 @@ impl App {
     /// Run benchmarks and store the results as a new datum.
     ///
     /// If successful, the new datum is printed to stdout.
+    /// Build a comparison row from two benchmark statistics.
+    fn build_comparison_row(
+        &self,
+        label: String,
+        stats1: &BenchStats,
+        stats2: &BenchStats,
+    ) -> (f64, Vec<Cell>) {
+        let mut row = Vec::new();
+        let ratio = stats2.mean / stats1.mean;
+        let change = (ratio - 1.0) * 100.0;
+        let abs_change = change.abs();
+
+        row.push(Cell::new(label));
+        row.push(Cell::new(format!(
+            "{:.0}±{:.1}",
+            stats1.mean, stats1.std_dev
+        )));
+        row.push(Cell::new(format!(
+            "{:.0}±{:.1}",
+            stats2.mean, stats2.std_dev
+        )));
+        row.push(Cell::new(format!("{ratio:.2}")));
+        let change_cell = if change < 0.0 {
+            Cell::new(format!("{abs_change:.2}% faster")).fg(Color::Green)
+        } else {
+            Cell::new(format!("{abs_change:.2}% slower")).fg(Color::Red)
+        };
+        row.push(change_cell);
+        (change, row)
+    }
+
+    /// Render and print a comparison table.
+    fn render_comparison_table(
+        &self,
+        mut rows: Vec<(f64, Vec<Cell>)>,
+        col1_label: &str,
+        col2_label: &str,
+        title: String,
+    ) {
+        let mut table = Table::new();
+        table.load_preset(comfy_table::presets::NOTHING);
+        table.set_header(vec![
+            "Benchmark",
+            &format!("{col1_label} (ms)"),
+            &format!("{col2_label} (ms)"),
+            "Ratio",
+            "Summary",
+        ]);
+        // Sort by speedup, descending. Handle NaN values by treating them as equal.
+        rows.sort_by(|(c1, _), (c2, _)| c1.partial_cmp(c2).unwrap_or(std::cmp::Ordering::Equal));
+        for (_, row) in rows {
+            table.add_row(row);
+        }
+
+        println!("{title}");
+        println!("{table}");
+    }
+
     fn cmd_bench(&self, comment: Option<String>) {
         if Command::new("rebench").arg("--version").output().is_err() {
             eprintln!(
@@ -293,7 +487,7 @@ impl App {
         println!("haste: created datum {id} {comment_s}");
     }
 
-    fn cmd_diff(&self, id1: usize, id2: usize) {
+    fn cmd_diff(&self, id1: usize, id2: usize, flat_mean: bool) {
         let data1 = ResultFile::new(&self.get_datum_results_path(id1));
         let data2 = ResultFile::new(&self.get_datum_results_path(id2));
 
@@ -302,58 +496,43 @@ impl App {
             process::exit(1);
         }
 
-        let data1 = data1.summarise();
-        let data2 = data2.summarise();
-
         let mut rows = Vec::new();
-        for (k, v1) in &data1 {
-            let mut row = Vec::new();
-            let v2 = data2[k];
-            let ratio = v2 / v1;
-            let change = (ratio - 1.0) * 100.0;
-            let abs_change = change.abs();
 
-            row.push(Cell::new(k));
-            row.push(Cell::new(format!("{v1:.0}")));
-            row.push(Cell::new(format!("{v2:.0}")));
-            row.push(Cell::new(format!("{ratio:.2}")));
-            let change_cell = if change < 0.0 {
-                Cell::new(format!("{abs_change:.2}% faster")).fg(Color::Green)
-            } else {
-                Cell::new(format!("{abs_change:.2}% slower")).fg(Color::Red)
-            };
-            row.push(change_cell);
-            rows.push((change, row));
-        }
+        if flat_mean {
+            let summary1 = data1.summarise_flat();
+            let summary2 = data2.summarise_flat();
 
-        let mut table = Table::new();
-        table.load_preset(comfy_table::presets::NOTHING);
-        table.set_header(vec![
-            "Benchmark",
-            &format!("Datum{id1} (ms)"),
-            &format!("Datum{id2} (ms)"),
-            "Ratio",
-            "Summary",
-        ]);
-        // Sort by speedup, descending.
-        rows.sort_by(|(c1, _), (c2, _)| c1.partial_cmp(c2).unwrap());
-        for (_, row) in rows {
-            table.add_row(row);
+            for (k, stats1) in &summary1 {
+                let stats2 = &summary2[k];
+                rows.push(self.build_comparison_row(k.to_string(), stats1, stats2));
+            }
+        } else {
+            let summary1 = data1.summarise();
+            let summary2 = data2.summarise();
+
+            for (k, stats1) in &summary1 {
+                let stats2 = &summary2[k];
+                rows.push(self.build_comparison_row(k.to_string(), stats1, stats2));
+            }
         }
 
         // If there's any extra metadata, print it.
         let extra1 = self.load_extra(id1);
         let extra2 = self.load_extra(id2);
+        let mut title = String::new();
         if extra1.comment.is_some() || extra2.comment.is_some() {
             let no_comment = "(no comment)".to_owned();
-            println!(
-                "Datum{id1}: {}",
+            title.push_str(&format!(
+                "Datum{id1}: {}\n",
                 extra1.comment.unwrap_or(no_comment.clone())
-            );
-            println!("Datum{id2}: {}\n", extra2.comment.unwrap_or(no_comment));
+            ));
+            title.push_str(&format!(
+                "Datum{id2}: {}\n\n",
+                extra2.comment.unwrap_or(no_comment)
+            ));
         }
 
-        println!("{table}");
+        self.render_comparison_table(rows, &format!("Datum{id1}"), &format!("Datum{id2}"), title);
     }
 
     fn cmd_list(&self) {
@@ -377,6 +556,75 @@ impl App {
             println!("{id:3}: {}", extra.comment.unwrap_or("".into()));
         }
     }
+
+    fn cmd_diff_exec(&self, id: usize, exec1: &str, exec2: &str, flat_mean: bool) {
+        let data = ResultFile::new(&self.get_datum_results_path(id));
+
+        let summary = if flat_mean {
+            data.summarise_flat()
+        } else {
+            data.summarise()
+        };
+
+        // Find benchmarks that have both executors and track extra_args
+        let mut bench_pairs: HashMap<String, (Option<BenchKey>, Option<BenchKey>)> = HashMap::new();
+        let mut found_exec1 = false;
+        let mut found_exec2 = false;
+
+        for k in summary.keys() {
+            if k.executor == exec1 {
+                found_exec1 = true;
+                bench_pairs
+                    .entry(k.benchmark.clone())
+                    .or_insert((None, None))
+                    .0 = Some(k.clone());
+            }
+            if k.executor == exec2 {
+                found_exec2 = true;
+                bench_pairs
+                    .entry(k.benchmark.clone())
+                    .or_insert((None, None))
+                    .1 = Some(k.clone());
+            }
+        }
+
+        if !found_exec1 {
+            eprintln!("error: executor '{}' not found in datum {}", exec1, id);
+            process::exit(1);
+        }
+        if !found_exec2 {
+            eprintln!("error: executor '{}' not found in datum {}", exec2, id);
+            process::exit(1);
+        }
+
+        let mut rows = Vec::new();
+        for (bench_name, (key1_opt, key2_opt)) in bench_pairs {
+            if let (Some(key1), Some(key2)) = (key1_opt, key2_opt) {
+                if let (Some(stats1), Some(stats2)) = (summary.get(&key1), summary.get(&key2)) {
+                    // Format as benchmark/extra_args (without executor since we're comparing executors)
+                    let bench_display = if key1.extra_args.is_empty() {
+                        bench_name.clone()
+                    } else {
+                        format!("{}/{}", bench_name, key1.extra_args)
+                    };
+
+                    rows.push(self.build_comparison_row(bench_display, stats1, stats2));
+                }
+            }
+        }
+
+        // Show metadata
+        let extra = self.load_extra(id);
+        let mut title = String::new();
+        if let Some(comment) = extra.comment {
+            title.push_str(&format!("Datum{id}: {comment}\n\n"));
+        }
+        title.push_str(&format!(
+            "Comparing executors within datum {id}: {exec1} vs {exec2}\n\n"
+        ));
+
+        self.render_comparison_table(rows, exec1, exec2, title);
+    }
 }
 
 #[derive(Parser)]
@@ -398,10 +646,26 @@ enum Mode {
     },
     /// Compare two datums.
     #[clap(visible_alias = "d")]
-    Diff { id1: usize, id2: usize },
+    Diff {
+        id1: usize,
+        id2: usize,
+        /// Use flat averaging across all measurements (like multitime)
+        #[clap(short, long)]
+        flat_mean: bool,
+    },
     /// List datums.
     #[clap(visible_alias = "l")]
     List,
+    /// Compare different executors within the same datum.
+    #[clap(visible_alias = "de")]
+    DiffExec {
+        id: usize,
+        executor1: String,
+        executor2: String,
+        /// Use flat averaging across all measurements (like multitime)
+        #[clap(short, long)]
+        flat_mean: bool,
+    },
 }
 
 fn main() {
@@ -409,7 +673,147 @@ fn main() {
     let cli = Cli::parse();
     match cli.mode {
         Mode::Bench { comment } => app.cmd_bench(comment),
-        Mode::Diff { id1, id2 } => app.cmd_diff(id1, id2),
+        Mode::Diff {
+            id1,
+            id2,
+            flat_mean,
+        } => app.cmd_diff(id1, id2, flat_mean),
         Mode::List => app.cmd_list(),
+        Mode::DiffExec {
+            id,
+            executor1,
+            executor2,
+            flat_mean,
+        } => app.cmd_diff_exec(id, &executor1, &executor2, flat_mean),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper function to create a test ResultFile from raw data
+    fn create_test_result_file(data: HashMap<BenchKey, Vec<Vec<f64>>>) -> ResultFile {
+        ResultFile { data }
+    }
+
+    #[test]
+    fn test_summarise() {
+        // Test summarise method
+        let mut data = HashMap::new();
+        let key = BenchKey {
+            benchmark: "bench1".to_string(),
+            executor: "exec1".to_string(),
+            extra_args: "args1".to_string(),
+        };
+        // Create data with 2 invocations, 3 iterations each
+        data.insert(
+            key.clone(),
+            vec![
+                vec![100.0, 110.0, 120.0], // Invocation 1: mean = (100 + 110 + 120) / 3 = 110
+                vec![200.0, 210.0, 220.0], // Invocation 2: mean = (200 + 210 + 220) / 3 = 210
+            ],
+        );
+
+        let result_file = create_test_result_file(data);
+
+        // Summarise: mean of means = (110 + 210) / 2 = 160
+        let summary = result_file.summarise();
+        assert!((summary[&key].mean - 160.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_summarise_flat() {
+        // Test flat-mean averaging across all measurements
+        let mut data = HashMap::new();
+        let key = BenchKey {
+            benchmark: "bench1".to_string(),
+            executor: "exec1".to_string(),
+            extra_args: "args1".to_string(),
+        };
+        // Create data with 2 invocations, different iteration counts
+        data.insert(
+            key.clone(),
+            vec![
+                vec![1.0, 2.0, 3.0, 4.0], // Invocation 1: 4 iterations
+                vec![2.0, 2.0, 2.0, 2.0], // Invocation 2: 4 iterations
+            ],
+        );
+
+        let result_file = create_test_result_file(data);
+
+        // Flat-mean summarise: flat average = (1+2+3+4+2+2+2+2) / 8 = 18 / 8 = 2.25
+        let summary = result_file.summarise_flat();
+        let stats = &summary[&key];
+
+        // Check mean
+        assert!(
+            (stats.mean - 2.25).abs() < 1e-10,
+            "Mean should be 2.25, got {}",
+            stats.mean
+        );
+
+        // Check standard deviation
+        // Values: 1, 2, 3, 4, 2, 2, 2, 2
+        // Mean: 2.25
+        // Variance: ((1-2.25)^2 + (2-2.25)^2 + (3-2.25)^2 + (4-2.25)^2 + 4*(2-2.25)^2) / 8
+        //         = (1.5625 + 0.0625 + 0.5625 + 3.0625 + 4*0.0625) / 8
+        //         = (1.5625 + 0.0625 + 0.5625 + 3.0625 + 0.25) / 8
+        //         = 5.5 / 8 = 0.6875
+        // StdDev: sqrt(0.6875) ≈ 0.8292
+        assert!(
+            (stats.std_dev - 0.8292).abs() < 0.001,
+            "StdDev should be ~0.8292, got {}",
+            stats.std_dev
+        );
+
+        // Check min and max
+        assert_eq!(stats.min, 1.0, "Min should be 1.0");
+        assert_eq!(stats.max, 4.0, "Max should be 4.0");
+
+        // Check median - sorted: [1, 2, 2, 2, 2, 2, 3, 4]
+        // With 8 elements (even), median is average of 4th and 5th elements: (2 + 2) / 2 = 2
+        assert_eq!(stats.median, 2.0, "Median should be 2.0");
+
+        // Check sample count
+        assert_eq!(stats.n_samples, 8, "Should have 8 samples");
+    }
+
+    #[test]
+    fn test_summarise_vs_flat_difference() {
+        // Test that the two summarization methods produce different standard deviations
+        let mut data = HashMap::new();
+        let key = BenchKey {
+            benchmark: "bench1".to_string(),
+            executor: "exec1".to_string(),
+            extra_args: "args1".to_string(),
+        };
+
+        data.insert(
+            key.clone(),
+            vec![
+                vec![10.0, 20.0],                   // Invocation 1: 2 iterations, mean = 15
+                vec![30.0, 40.0, 50.0, 60.0, 70.0], // Invocation 2: 5 iterations, mean = 50
+            ],
+        );
+
+        let result_file = create_test_result_file(data);
+
+        // Test mean-of-means (summarise)
+        let summary = result_file.summarise();
+        let stats = &summary[&key];
+
+        // Test flat average (summarise_flat)
+        let stats_flat = &result_file.summarise_flat()[&key];
+
+        // Mean-of-means: (15 + 50) / 2 = 32.5
+        // Flat average: (10+20+30+40+50+60+70) / 7 = 280 / 7 = 40.0
+        // These are different!
+        assert!(
+            stats.mean != stats_flat.mean,
+            "The two methods should produce different means: {} vs {}",
+            stats.mean,
+            stats_flat.mean
+        );
     }
 }
