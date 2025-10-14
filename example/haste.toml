@@ -1,0 +1,17 @@
+# Example haste setup.
+#
+# It measures a couple of shells using a simple benchmark.
+
+proc_execs = 3
+inproc_iters = 5
+
+[executors]
+sh = "/bin/sh"
+bash = "/bin/bash"
+
+[suites.example]
+dir = "."
+harness = "harness.sh"
+
+[suites.example.benchmarks.bigloop]
+extra_args = ["100000"]

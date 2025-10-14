@@ -20,3 +20,11 @@ cargo fmt --all -- --check
 cargo clippy --all-features --tests
 cargo test
 cargo test --release
+
+# Some very rudimentary checks.
+cd example
+shellcheck harness.sh
+cargo run -- b -c first
+cargo run --release -- b -c second
+cargo run --release -- l
+cargo run --release -- d 0 1

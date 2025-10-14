@@ -1,14 +1,15 @@
 use clap::{Parser, Subcommand};
 use comfy_table::{Cell, Color, Table};
 use serde::{Deserialize, Serialize};
-use std::process::Command;
 use std::{
     collections::{HashMap, HashSet},
     env, fmt, fs,
-    io::{BufRead, BufReader},
-    path::{Path, PathBuf},
+    path::PathBuf,
     process,
 };
+
+mod config;
+mod runner;
 
 /// The `extra.toml` file for a datum
 #[derive(Default, Serialize, Deserialize)]
@@ -18,13 +19,15 @@ struct ExtraToml {
 
 /// The name of the hidden directory we store state inside.
 const DOT_DIR: &str = ".haste";
+/// The name of the haste config file.
+const CONFIG_FILE: &str = "haste.toml";
 
 /// Uniquely identifies a benchmark.
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 struct BenchKey {
     benchmark: String,
     executor: String,
-    extra_args: String,
+    extra_args: Vec<String>,
 }
 
 impl fmt::Display for BenchKey {
@@ -32,150 +35,49 @@ impl fmt::Display for BenchKey {
         write!(
             f,
             "{}/{}/{}",
-            self.benchmark, self.executor, self.extra_args
+            self.benchmark,
+            self.executor,
+            self.extra_args.join("-")
         )
     }
 }
 
-/// Rebench data file parser.
-#[derive(Debug)]
+/// The results file for a datum.
+#[derive(Serialize, Deserialize, Debug, Default)]
 struct ResultFile {
-    data: HashMap<BenchKey, Vec<Vec<f64>>>,
+    // String benchmark key -> collection of process execution times.
+    data: HashMap<String, Vec<f64>>,
 }
 
 impl ResultFile {
-    fn new(p: &Path) -> Self {
-        let f = fs::File::open(p).unwrap_or_else(|_| {
-            eprintln!("Couldn't open results file {}", p.to_str().unwrap());
-            std::process::exit(1);
-        });
-        let rdr = BufReader::new(f);
-        let mut first = true;
-        let mut col_indices = HashMap::new();
-        let mut data: HashMap<BenchKey, Vec<Vec<f64>>> = HashMap::new();
-
-        let mut last_key = None;
-        let mut last_invoc = 0;
-        let mut last_iter = 0;
-
-        for l in rdr.lines().map(|x| x.unwrap()) {
-            let l = l.trim();
-            if l.starts_with("#") {
-                continue;
-            }
-
-            if first {
-                // Cache the column headings.
-                for (i, name) in l.split_whitespace().enumerate() {
-                    col_indices.insert(name.to_string(), i);
-                }
-                first = false;
-            } else {
-                let row = l.split_whitespace().collect::<Vec<&str>>();
-
-                // extract the columns we care about.
-                let benchmark = row[col_indices["benchmark"]].to_owned();
-                let executor = row[col_indices["executor"]].to_owned();
-                let extra_args = row[col_indices["extraArgs"]].to_owned();
-                let invoc = row[col_indices["invocation"]].parse::<usize>().unwrap();
-                let iter = row[col_indices["iteration"]].parse::<usize>().unwrap();
-                let value = row[col_indices["value"]].parse::<f64>().unwrap();
-                assert_eq!(row[col_indices["unit"]], "ms"); // expect miliseconds.
-
-                let key = BenchKey {
-                    benchmark,
-                    executor,
-                    extra_args,
-                };
-
-                // We assume the rows come in sequential invocation and iteration order.
-                assert!(
-                    invoc == last_invoc && iter == last_iter + 1
-                        || invoc == last_invoc + 1 && iter == 1
-                        || last_key.is_some()
-                            && key != last_key.unwrap()
-                            && invoc == 1
-                            && iter == 1
-                );
-
-                if !data.contains_key(&key) {
-                    data.insert(key.clone(), Vec::new());
-                }
-                let invocs = data.get_mut(&key).unwrap();
-                if invocs.len() < invoc {
-                    invocs.push(Vec::new());
-                }
-                assert_eq!(invocs.len(), invoc);
-                let iters = &mut invocs[invoc - 1];
-                iters.push(value);
-                assert_eq!(iters.len(), iter);
-
-                last_key = Some(key.to_owned());
-                last_invoc = invoc;
-                last_iter = iter;
-            }
+    fn summarise(&self) -> HashMap<String, f64> {
+        let mut summary = HashMap::new();
+        for (k, invocs) in &self.data {
+            let n = f64::from(u32::try_from(invocs.len()).unwrap());
+            summary.insert(k.to_owned(), invocs.iter().sum::<f64>() / n);
         }
-
-        // Check all invocations contain the same number of iterations.
-        for (k, invocs) in &data {
-            let mut count = None;
-            for invoc in invocs {
-                if let Some(c) = count {
-                    if c != invoc.len() {
-                        eprintln!("error: not all invocations have the same number of iterations!");
-                        eprintln!("  in file {} for benchmark {}", p.to_str().unwrap(), k);
-                        process::exit(1);
-                    }
-                } else {
-                    count = Some(invoc.len());
-                }
-            }
-        }
-
-        Self { data }
+        summary
     }
 
-    /// Check the results files have the same data dimensionality.
+    /// Check the results have the same data dimensionality.
     ///
     /// Returns `Ok(())` iff the same set of benchmarks were run and the same number of invocations
     /// and iterations were run (on a per-benchmark basis).
     ///
-    /// Each result file is assumed to be consistent in isolation.
+    /// Each set of results is assumed to be consistent in isolation.
     fn same_dims(&self, other: &ResultFile) -> Result<(), String> {
-        let self_keys: HashSet<&BenchKey> = HashSet::from_iter(self.data.keys());
-        let other_keys: HashSet<&BenchKey> = HashSet::from_iter(other.data.keys());
+        let self_keys: HashSet<&String> = HashSet::from_iter(self.data.keys());
+        let other_keys: HashSet<&String> = HashSet::from_iter(other.data.keys());
         if self_keys != other_keys {
             return Err("results files contain different benchmarks".into());
         }
         for (k, v1) in &self.data {
             let v2 = &other.data[k];
             if v1.len() != v2.len() {
-                return Err(format!("different number of invocations for {k}"));
-            }
-            if v1[0].len() != v2[0].len() {
-                return Err(format!("different number of iterations for {k}"));
+                return Err(format!("different number of process executions for {k}"));
             }
         }
         Ok(())
-    }
-
-    /// Produce summary statistics for each benchmark in the results file.
-    ///
-    /// Returns a HashMap mapping each benchmark key to an arithmetic mean wallclock time for one
-    /// iteration.
-    fn summarise(&self) -> HashMap<BenchKey, f64> {
-        let mut summary = HashMap::new();
-        for (k, invocs) in &self.data {
-            let mut invoc_means: Vec<f64> = Vec::new();
-            for invoc in invocs {
-                invoc_means.push(invoc.iter().sum::<f64>() / invoc.len() as f64);
-            }
-            summary.insert(
-                k.to_owned(),
-                invoc_means.iter().sum::<f64>() / invoc_means.len() as f64,
-            );
-        }
-        summary
     }
 }
 
@@ -218,14 +120,16 @@ impl App {
     }
 
     /// Store a new datum and return the ID.
-    fn store_datum(&self, comment: Option<String>) -> usize {
+    fn store_datum(&self, results: ResultFile, comment: Option<String>) -> usize {
         let id = self.next_id();
         let datum_dir = self.get_datum_dir(id);
         fs::create_dir(&datum_dir).unwrap();
-        let copy_to = self.get_datum_results_path(id);
-        fs::rename("benchmark.data", copy_to).unwrap();
+        let res_path = self.get_datum_results_path(id);
+        let tml = toml::to_string(&results).unwrap();
+        fs::write(res_path, tml).unwrap();
 
         // Write out the extra metadata.
+        // FIXME: consider merging this into the main toml file.
         let extra_data = toml::to_string(&ExtraToml { comment }).unwrap();
         let extra_path = self.get_datum_extra_path(id);
         std::fs::write(extra_path, extra_data).unwrap();
@@ -239,7 +143,7 @@ impl App {
 
     fn get_datum_results_path(&self, id: usize) -> PathBuf {
         let mut p = self.get_datum_dir(id);
-        p.push("benchmark.data");
+        p.push("data.toml");
         p
     }
 
@@ -262,40 +166,28 @@ impl App {
     ///
     /// If successful, the new datum is printed to stdout.
     fn cmd_bench(&self, comment: Option<String>) {
-        if Command::new("rebench").arg("--version").output().is_err() {
-            eprintln!(
-                "error: `rebench` binary not found or not executable. Please ensure it is installed and in your PATH."
-            );
+        let config_text = fs::read_to_string(CONFIG_FILE).unwrap_or_else(|e| {
+            eprintln!("error: failed to read {CONFIG_FILE}: {e}");
             process::exit(1);
-        }
-
-        let mut cmd = Command::new("rebench");
-        cmd.args(["-c", "--no-denoise", "rebench.conf"]);
-
-        let Ok(mut child) = cmd.spawn() else {
-            eprintln!("error: failed to spawn benchmarks!");
-            eprintln!("args: {cmd:?}");
-            process::exit(1)
+        });
+        let config: config::Config = match toml::from_str(&config_text) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("Unable to parse {CONFIG_FILE}: {e}");
+                std::process::exit(1);
+            }
         };
-
-        let status = child.wait().unwrap();
-        if !status.success() {
-            eprintln!("error: benchmark command exited non-zero!");
-            process::exit(1)
-        }
-        let id = self.store_datum(comment.to_owned());
-
-        let comment_s = if let Some(c) = comment {
-            &format!("[{c}]")
-        } else {
-            ""
-        };
+        let results = runner::run(&config);
+        let id = self.store_datum(results, comment.to_owned());
+        let comment_s = comment.unwrap_or("".to_owned());
         println!("haste: created datum {id} {comment_s}");
     }
 
     fn cmd_diff(&self, id1: usize, id2: usize) {
-        let data1 = ResultFile::new(&self.get_datum_results_path(id1));
-        let data2 = ResultFile::new(&self.get_datum_results_path(id2));
+        let tml1 = fs::read_to_string(self.get_datum_results_path(id1)).unwrap();
+        let tml2 = fs::read_to_string(self.get_datum_results_path(id2)).unwrap();
+        let data1 = toml::from_str::<ResultFile>(&tml1).unwrap();
+        let data2 = toml::from_str::<ResultFile>(&tml2).unwrap();
 
         if let Err(e) = data1.same_dims(&data2) {
             eprintln!("{e}");
@@ -388,8 +280,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Mode {
-    /// Run rebench and store the results into a new datum.
-    /// The rebench config `$PWD/rebench.conf` is used.
+    /// Run benchmarks and store the results into a new datum.
     #[clap(visible_alias = "b")]
     Bench {
         /// Attach a comment to the datum.
