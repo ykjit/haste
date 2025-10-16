@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use comfy_table::{Cell, Color, Table};
+use comfy_table::{Cell, CellAlignment, Color, Table};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -10,6 +10,11 @@ use std::{
 
 mod config;
 mod runner;
+
+/// The z* value used for a 95% confidence interval.
+const CI_ZVAL: f64 = 1.96;
+/// The confidence level of the above, as a percentage.
+const CI_CONF: f64 = 95.;
 
 /// The `extra.toml` file for a datum
 #[derive(Default, Serialize, Deserialize)]
@@ -42,6 +47,42 @@ impl fmt::Display for BenchKey {
     }
 }
 
+struct SummaryStats {
+    /// Sample arithmentic mean.
+    mean: f64,
+    /// The `CI_CONF`% confidence interval.
+    ///
+    /// We report the mean +/- this value.
+    ci: f64,
+}
+
+impl SummaryStats {
+    fn new(mean: f64, ci: f64) -> Self {
+        Self { mean, ci }
+    }
+
+    /// Determine if two confidence intervals overlap.
+    fn ci_overlaps(&self, other: &Self) -> bool {
+        let l1 = self.mean - self.ci;
+        let u1 = self.mean + self.ci;
+        let l2 = other.mean - other.ci;
+        let u2 = other.mean + other.ci;
+        l1 <= u2 && l2 <= u1
+    }
+}
+
+/// Computes a consistent width for fomatting floats in a colum so they all line up nicely.
+fn compute_f64_format(fs: &[f64]) -> usize {
+    let mut max_width = 1;
+    for f in fs {
+        let s = format!("{:.0}", f);
+        if s.len() > max_width {
+            max_width = s.len();
+        }
+    }
+    max_width
+}
+
 /// The results file for a datum.
 #[derive(Serialize, Deserialize, Debug, Default)]
 struct ResultFile {
@@ -50,13 +91,28 @@ struct ResultFile {
 }
 
 impl ResultFile {
-    fn summarise(&self) -> HashMap<String, f64> {
-        let mut summary = HashMap::new();
+    fn summarise(&self) -> HashMap<String, SummaryStats> {
+        let mut summaries = HashMap::new();
         for (k, invocs) in &self.data {
             let n = f64::from(u32::try_from(invocs.len()).unwrap());
-            summary.insert(k.to_owned(), invocs.iter().sum::<f64>() / n);
+            let mean = invocs.iter().sum::<f64>() / n;
+
+            // Compute a confidence interval, as per:
+            // https://www.dummies.com/article/academics-the-arts/math/statistics/how-to-calculate-a-confidence-interval-for-a-population-mean-when-you-know-its-standard-deviation-169722/
+            let ci = if invocs.len() > 1 {
+                let variance = invocs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.);
+                let std_dev = variance.sqrt();
+                CI_ZVAL * std_dev / n.sqrt()
+            } else {
+                // Avoid division by zero in case there is a single sample.
+                // In this case, report a CI of +/- 0.
+                0.
+            };
+
+            let summary = SummaryStats::new(mean, ci);
+            summaries.insert(k.to_owned(), summary);
         }
-        summary
+        summaries
     }
 
     /// Check the results have the same data dimensionality.
@@ -197,39 +253,74 @@ impl App {
         let data1 = data1.summarise();
         let data2 = data2.summarise();
 
-        let mut rows = Vec::new();
+        // Compute the formatting of our data.
+        let means = data1
+            .iter()
+            .chain(&data2)
+            .map(|(_, s)| s.mean)
+            .collect::<Vec<f64>>();
+        let mean_width = compute_f64_format(&means);
+        let cis = data1
+            .iter()
+            .chain(&data2)
+            .map(|(_, s)| s.ci)
+            .collect::<Vec<f64>>();
+        let ci_width = compute_f64_format(&cis);
+        let mut ratios = Vec::new();
+        for (key, s1) in data1.iter() {
+            let s2 = &data2[key];
+            ratios.push(s2.mean / s1.mean);
+        }
+        let ratio_width = compute_f64_format(&ratios) + 3;
+
+        let mut sig_rows = Vec::new();
+        let mut insig_rows = Vec::new();
         for (k, v1) in &data1 {
             let mut row = Vec::new();
-            let v2 = data2[k];
-            let ratio = v2 / v1;
+            let v2 = &data2[k];
+            let ratio = v2.mean / v1.mean;
             let change = (ratio - 1.0) * 100.0;
             let abs_change = change.abs();
 
             row.push(Cell::new(k));
-            row.push(Cell::new(format!("{v1:.0}")));
-            row.push(Cell::new(format!("{v2:.0}")));
-            row.push(Cell::new(format!("{ratio:.2}")));
-            let change_cell = if change < 0.0 {
-                Cell::new(format!("{abs_change:.2}% faster")).fg(Color::Green)
+            let v1_cell = Cell::new(format!("{:mean_width$.0} ±{:ci_width$.0}", v1.mean, v1.ci));
+            row.push(v1_cell.set_alignment(CellAlignment::Right));
+            let v2_cell = Cell::new(format!("{:mean_width$.0} ±{:ci_width$.0}", v2.mean, v2.ci));
+            row.push(v2_cell.set_alignment(CellAlignment::Right));
+            let ratio_cell = Cell::new(format!("{ratio:>ratio_width$.2}"));
+            row.push(ratio_cell.set_alignment(CellAlignment::Right));
+
+            if !v1.ci_overlaps(v2) {
+                let change_cell = if change < 0.0 {
+                    Cell::new(format!("{abs_change:.2}% faster")).fg(Color::Green)
+                } else {
+                    Cell::new(format!("{abs_change:.2}% slower")).fg(Color::Red)
+                };
+                row.push(change_cell);
+                sig_rows.push((change, row));
             } else {
-                Cell::new(format!("{abs_change:.2}% slower")).fg(Color::Red)
-            };
-            row.push(change_cell);
-            rows.push((change, row));
+                row.push(Cell::new("indistinguishable".to_owned()).fg(Color::Magenta));
+                insig_rows.push((change, row));
+            }
         }
 
         let mut table = Table::new();
         table.load_preset(comfy_table::presets::NOTHING);
         table.set_header(vec![
-            "Benchmark",
-            &format!("Datum{id1} (ms)"),
-            &format!("Datum{id2} (ms)"),
-            "Ratio",
-            "Summary",
+            Cell::new("Benchmark").set_alignment(CellAlignment::Left),
+            Cell::new(format!("Datum{id1} (ms)")).set_alignment(CellAlignment::Right),
+            Cell::new(format!("Datum{id2} (ms)")).set_alignment(CellAlignment::Right),
+            Cell::new("Ratio").set_alignment(CellAlignment::Right),
+            Cell::new("Summary").set_alignment(CellAlignment::Left),
         ]);
-        // Sort by speedup, descending.
-        rows.sort_by(|(c1, _), (c2, _)| c1.partial_cmp(c2).unwrap());
-        for (_, row) in rows {
+        // Sort the rows first by significance, then by speedup, descending.
+        sig_rows.sort_by(|(c1, _), (c2, _)| c1.partial_cmp(c2).unwrap());
+        for (_, row) in sig_rows {
+            table.add_row(row);
+        }
+        // Insignifcant results: sort by speedup, descending.
+        insig_rows.sort_by(|(c1, _), (c2, _)| c1.partial_cmp(c2).unwrap());
+        for (_, row) in insig_rows {
             table.add_row(row);
         }
 
@@ -245,6 +336,7 @@ impl App {
             println!("Datum{id2}: {}\n", extra2.comment.unwrap_or(no_comment));
         }
 
+        println!("confidence level: {}%\n", CI_CONF);
         println!("{table}");
     }
 
@@ -302,5 +394,36 @@ fn main() {
         Mode::Bench { comment } => app.cmd_bench(comment),
         Mode::Diff { id1, id2 } => app.cmd_diff(id1, id2),
         Mode::List => app.cmd_list(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SummaryStats;
+
+    #[test]
+    fn cis_overlap() {
+        let s1 = SummaryStats::new(10., 5.);
+        let s2 = SummaryStats::new(5., 8.);
+        let s3 = SummaryStats::new(50.6, 20.6667);
+        let s4 = SummaryStats::new(-0.5, 0.1);
+        let s5 = SummaryStats::new(-0.5, 0.2);
+        assert!(s1.ci_overlaps(&s2));
+        assert!(s2.ci_overlaps(&s1));
+        assert!(s1.ci_overlaps(&s1));
+        assert!(s2.ci_overlaps(&s2));
+        assert!(!s1.ci_overlaps(&s3));
+        assert!(!s3.ci_overlaps(&s1));
+        assert!(s1.ci_overlaps(&s1));
+        assert!(s2.ci_overlaps(&s2));
+        assert!(s3.ci_overlaps(&s3));
+        assert!(s4.ci_overlaps(&s5));
+        assert!(s5.ci_overlaps(&s4));
+        assert!(!s4.ci_overlaps(&s1));
+        assert!(s4.ci_overlaps(&s2));
+        assert!(!s4.ci_overlaps(&s3));
+        assert!(!s5.ci_overlaps(&s1));
+        assert!(s5.ci_overlaps(&s2));
+        assert!(!s5.ci_overlaps(&s3));
     }
 }
