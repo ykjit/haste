@@ -140,17 +140,23 @@ impl ResultFile {
 struct App {
     /// The directory where persistent state is stored.
     state_dir: PathBuf,
+    /// The path to the config file.
+    config_file: PathBuf,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(config_file: Option<PathBuf>) -> Self {
         let state_dir = [env::current_dir().unwrap().to_str().unwrap(), DOT_DIR]
             .iter()
             .collect();
         if !fs::exists(&state_dir).unwrap() {
             fs::create_dir(&state_dir).unwrap();
         }
-        Self { state_dir }
+        let config_file = config_file.unwrap_or_else(|| PathBuf::from(CONFIG_FILE));
+        Self {
+            state_dir,
+            config_file,
+        }
     }
 
     /// Determine the next available datum ID.
@@ -222,14 +228,15 @@ impl App {
     ///
     /// If successful, the new datum is printed to stdout.
     fn cmd_bench(&self, comment: Option<String>) {
-        let config_text = fs::read_to_string(CONFIG_FILE).unwrap_or_else(|e| {
-            eprintln!("error: failed to read {CONFIG_FILE}: {e}");
+        let config_path = self.config_file.display();
+        let config_text = fs::read_to_string(&self.config_file).unwrap_or_else(|e| {
+            eprintln!("error: failed to read {config_path}: {e}");
             process::exit(1);
         });
         let config: config::Config = match toml::from_str(&config_text) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("Unable to parse {CONFIG_FILE}: {e}");
+                eprintln!("Unable to parse {config_path}: {e}");
                 std::process::exit(1);
             }
         };
@@ -366,6 +373,10 @@ impl App {
 #[derive(Parser)]
 #[command(version, about, subcommand_required = true)]
 struct Cli {
+    /// Path to the haste configuration file (defaults to haste.toml).
+    #[arg(short = 'f', long, global = true, value_name = "FILE")]
+    file: Option<PathBuf>,
+
     #[command(subcommand)]
     mode: Mode,
 }
@@ -388,8 +399,8 @@ enum Mode {
 }
 
 fn main() {
-    let app = App::new();
     let cli = Cli::parse();
+    let app = App::new(cli.file);
     match cli.mode {
         Mode::Bench { comment } => app.cmd_bench(comment),
         Mode::Diff { id1, id2 } => app.cmd_diff(id1, id2),
@@ -399,7 +410,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::SummaryStats;
+    use super::{App, CONFIG_FILE, SummaryStats};
+    use std::path::PathBuf;
 
     #[test]
     fn cis_overlap() {
@@ -425,5 +437,70 @@ mod tests {
         assert!(!s5.ci_overlaps(&s1));
         assert!(s5.ci_overlaps(&s2));
         assert!(!s5.ci_overlaps(&s3));
+    }
+
+    #[test]
+    fn test_default_config_path() {
+        use std::fs;
+
+        // Create a temporary directory for testing
+        let temp_dir = std::env::temp_dir().join("haste_test_default");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp_dir).unwrap();
+
+        // Create the app with no config specified
+        let app = App::new(None);
+
+        // Should use the default CONFIG_FILE
+        assert_eq!(app.config_file, PathBuf::from(CONFIG_FILE));
+
+        // Cleanup
+        std::env::set_current_dir(original_dir).unwrap();
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_config_file_loading() {
+        use std::fs;
+
+        let temp_dir = std::env::temp_dir().join("haste_test_loading");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        // Create a test config file
+        let config_content = r#"
+        proc_execs = 2
+        inproc_iters = 3
+
+        [executors]
+        test_exec = "/bin/sh"
+
+        [suites.test_suite]
+        dir = "."
+        harness = "test.sh"
+
+        [suites.test_suite.benchmarks.test_bench]
+        extra_args = ["arg1"]
+        "#;
+        let config_path = temp_dir.join("test_config.toml");
+        fs::write(&config_path, config_content).unwrap();
+
+        // Parse the config
+        let config_text = fs::read_to_string(&config_path).unwrap();
+        let config: crate::config::Config = toml::from_str(&config_text).unwrap();
+
+        // Verify parsed values
+        assert_eq!(config.proc_execs, 2);
+        assert_eq!(config.inproc_iters, 3);
+        assert_eq!(config.executors.len(), 1);
+        assert!(config.executors.contains_key("test_exec"));
+        assert_eq!(config.suites.len(), 1);
+        assert!(config.suites.contains_key("test_suite"));
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
