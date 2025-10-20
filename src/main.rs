@@ -25,7 +25,7 @@ struct ExtraToml {
 /// The name of the hidden directory we store state inside.
 const DOT_DIR: &str = ".haste";
 /// The name of the haste config file.
-const CONFIG_FILE: &str = "haste.toml";
+const DEFAULT_CONFIG_FILE: &str = "haste.toml";
 
 /// Uniquely identifies a benchmark.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -152,7 +152,7 @@ impl App {
         if !fs::exists(&state_dir).unwrap() {
             fs::create_dir(&state_dir).unwrap();
         }
-        let config_file = config_file.unwrap_or_else(|| PathBuf::from(CONFIG_FILE));
+        let config_file = config_file.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_FILE));
         Self {
             state_dir,
             config_file,
@@ -410,7 +410,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, CONFIG_FILE, SummaryStats};
+    use super::{App, DEFAULT_CONFIG_FILE, SummaryStats};
     use std::path::PathBuf;
 
     #[test]
@@ -455,7 +455,7 @@ mod tests {
         let app = App::new(None);
 
         // Should use the default CONFIG_FILE
-        assert_eq!(app.config_file, PathBuf::from(CONFIG_FILE));
+        assert_eq!(app.config_file, PathBuf::from(DEFAULT_CONFIG_FILE));
 
         // Cleanup
         std::env::set_current_dir(original_dir).unwrap();
