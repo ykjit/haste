@@ -373,10 +373,6 @@ impl App {
 #[derive(Parser)]
 #[command(version, about, subcommand_required = true)]
 struct Cli {
-    /// Path to the haste configuration file (defaults to haste.toml).
-    #[arg(short = 'f', long, global = true, value_name = "FILE")]
-    file: Option<PathBuf>,
-
     #[command(subcommand)]
     mode: Mode,
 }
@@ -386,6 +382,9 @@ enum Mode {
     /// Run benchmarks and store the results into a new datum.
     #[clap(visible_alias = "b")]
     Bench {
+        /// Path to the haste configuration file (defaults to haste.toml).
+        #[arg(short = 'f', long, value_name = "FILE")]
+        file: Option<PathBuf>,
         /// Attach a comment to the datum.
         #[clap(short, long, num_args(1))]
         comment: Option<String>,
@@ -400,11 +399,19 @@ enum Mode {
 
 fn main() {
     let cli = Cli::parse();
-    let app = App::new(cli.file);
     match cli.mode {
-        Mode::Bench { comment } => app.cmd_bench(comment),
-        Mode::Diff { id1, id2 } => app.cmd_diff(id1, id2),
-        Mode::List => app.cmd_list(),
+        Mode::Bench { file, comment } => {
+            let app = App::new(file);
+            app.cmd_bench(comment);
+        }
+        Mode::Diff { id1, id2 } => {
+            let app = App::new(None);
+            app.cmd_diff(id1, id2);
+        }
+        Mode::List => {
+            let app = App::new(None);
+            app.cmd_list();
+        }
     }
 }
 
