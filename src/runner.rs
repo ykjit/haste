@@ -1,6 +1,7 @@
 use crate::BenchKey;
 use crate::{ResultFile, config::*};
 use std::hint::black_box;
+use std::io::{self, Write};
 use std::path::Path;
 use std::process::{self, Command, Stdio};
 
@@ -53,7 +54,8 @@ fn run_suite(
         };
         for _ in 0..(config.proc_execs) {
             let progress = get_progress_percentage(config, *completed_pexecs);
-            println!(">>> haste: ({progress:3.0}%) Running {key}");
+            print!(">>> haste: {:3.0}% {key}", progress.round() as i64);
+            io::stdout().flush().ok();
             run_benchmark(
                 results,
                 config,
@@ -104,6 +106,7 @@ fn run_benchmark(
     let elapsed = f64::from(u32::try_from(t.elapsed().as_millis()).unwrap());
 
     if !output.status.success() {
+        println!("");
         eprintln!("error: benchmark command exited non-zero!");
         eprintln!("args: {cmd:?}");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -117,7 +120,7 @@ fn run_benchmark(
         process::exit(1)
     }
 
-    println!(">>> haste: {elapsed}ms");
+    println!(" {elapsed}ms");
 
     let bench_key = BenchKey {
         benchmark: bench_name.to_owned(),
