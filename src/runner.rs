@@ -110,7 +110,7 @@ fn run_benchmark(
         eprintln!("--- Begin stdout ---");
         eprint!("{stdout}");
         eprintln!("--- End stdout ---");
-        let stderr = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         eprintln!("--- Begin stderr ---");
         eprint!("{stderr}");
         eprintln!("--- End stderr ---");
