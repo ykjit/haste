@@ -52,9 +52,9 @@ fn run_suite(
             executor: executor_name.into(),
             extra_args: bench.extra_args.clone(),
         };
-        for _ in 0..(config.proc_execs) {
-            let progress = get_progress_percentage(config, *completed_pexecs);
-            print!(">>> haste: {:3.0}% {key}", progress.round() as i64);
+        let progress = get_progress_percentage(config, *completed_pexecs);
+        print!(">>> haste: {:3.0}% {key} ...", progress.round() as i64);
+        for i in 0..(config.proc_execs) {
             io::stdout().flush().ok();
             run_benchmark(
                 results,
@@ -66,7 +66,24 @@ fn run_suite(
                 bench,
             );
             *completed_pexecs += 1;
+            let progress = get_progress_percentage(config, *completed_pexecs);
+            let so_far = results
+                .data
+                .get(&key.to_string())
+                .unwrap()
+                .iter()
+                .map(|x| format!("{x}ms"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            print!(
+                "\r>>> haste: {:3.0}% {key} {so_far}",
+                progress.round() as i64
+            );
+            if i + 1 < config.proc_execs {
+                print!(" ...");
+            }
         }
+        println!();
     }
 }
 
@@ -106,7 +123,7 @@ fn run_benchmark(
     let elapsed = f64::from(u32::try_from(t.elapsed().as_millis()).unwrap());
 
     if !output.status.success() {
-        println!("");
+        println!();
         eprintln!("error: benchmark command exited non-zero!");
         eprintln!("args: {cmd:?}");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -119,8 +136,6 @@ fn run_benchmark(
         eprintln!("--- End stderr ---");
         process::exit(1)
     }
-
-    println!(" {elapsed}ms");
 
     let bench_key = BenchKey {
         benchmark: bench_name.to_owned(),
