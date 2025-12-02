@@ -86,7 +86,7 @@ fn compute_f64_format(fs: &[f64]) -> usize {
 /// The results file for a datum.
 #[derive(Serialize, Deserialize, Debug, Default)]
 struct ResultFile {
-    // String benchmark key -> collection of process execution times.
+    // String benchmark key -> collection of process execution times (in milliseconds).
     data: HashMap<String, Vec<f64>>,
 }
 
