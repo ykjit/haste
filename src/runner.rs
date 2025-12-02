@@ -4,18 +4,46 @@ use std::hint::black_box;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::{self, Command, Stdio};
+use std::time::Duration;
 
-fn get_progress_percentage(config: &Config, completed_pexecs: usize) -> f64 {
+fn total_pexecs(config: &Config) -> usize {
     let mut total_pexecs = 0;
     for suite in &config.suites {
         total_pexecs += suite.1.benchmarks.len();
     }
     total_pexecs *= config.executors.len();
     total_pexecs *= config.proc_execs;
+    total_pexecs
+}
 
+fn get_progress_percentage(config: &Config, completed_pexecs: usize) -> f64 {
     let completed_pexecs = f64::from(u32::try_from(completed_pexecs).unwrap());
-    let total_pexecs = f64::from(u32::try_from(total_pexecs).unwrap());
+    let total_pexecs = f64::from(u32::try_from(total_pexecs(config)).unwrap());
     completed_pexecs / total_pexecs * 100.
+}
+
+fn get_eta(config: &Config, results: &ResultFile, completed_pexecs: usize) -> String {
+    if completed_pexecs == 0 {
+        return "...".to_owned();
+    }
+    let msecs = (results.data.values().flatten().sum::<f64>()
+        / f64::from(u32::try_from(completed_pexecs).unwrap()))
+        * f64::from(u32::try_from(total_pexecs(config) - completed_pexecs).unwrap());
+    let dur = Duration::from_millis(msecs as u64);
+    let secs = dur.as_secs();
+    if secs >= 24 * 60 * 60 {
+        let days = secs / 86400;
+        let hours = (secs % 86400) / 3600;
+        format!("{}d:{}h", days, hours)
+    } else if secs < 60 * 60 {
+        let minutes = (secs % 3600) / 60;
+        let seconds = secs % 60;
+        format!("{}m:{:02}s", minutes, seconds)
+    } else {
+        let hours = secs / 3600;
+        let minutes = (secs % 3600) / 60;
+        format!("{}H:{:02}m", hours, minutes)
+    }
 }
 
 /// Run all benchmarks from the configuration.
@@ -53,7 +81,11 @@ fn run_suite(
             extra_args: bench.extra_args.clone(),
         };
         let progress = get_progress_percentage(config, *completed_pexecs);
-        print!(">>> haste: {:3.0}% {key} ...", progress.round() as i64);
+        let eta = get_eta(config, results, *completed_pexecs);
+        print!(
+            ">>> haste: {:3.0}% (ETA {eta}) {key} ...",
+            progress.round() as i64
+        );
         for i in 0..(config.proc_execs) {
             io::stdout().flush().ok();
             run_benchmark(
@@ -67,6 +99,7 @@ fn run_suite(
             );
             *completed_pexecs += 1;
             let progress = get_progress_percentage(config, *completed_pexecs);
+            let eta = get_eta(config, results, *completed_pexecs);
             let so_far = results
                 .data
                 .get(&key.to_string())
@@ -76,7 +109,7 @@ fn run_suite(
                 .collect::<Vec<_>>()
                 .join(" ");
             print!(
-                "\r>>> haste: {:3.0}% {key} {so_far}",
+                "\r>>> haste: {:3.0}% (ETA {eta}) {key} {so_far}",
                 progress.round() as i64
             );
             if i + 1 < config.proc_execs {
