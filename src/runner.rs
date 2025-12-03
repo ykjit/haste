@@ -5,6 +5,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::{self, Command, Stdio};
 use std::time::Duration;
+use terminal_size::terminal_size;
 
 fn total_pexecs(config: &Config) -> usize {
     let mut total_pexecs = 0;
@@ -65,6 +66,26 @@ pub(crate) fn run(config: &Config) -> ResultFile {
     results
 }
 
+fn hide_cursor() {
+    let mut out = io::stdout();
+    write!(out, "\x1B[?25l").ok(); // hide
+    out.flush().ok();
+}
+
+fn show_cursor() {
+    let mut out = io::stdout();
+    write!(out, "\x1B[?25h").ok(); // hide
+    out.flush().ok();
+}
+
+fn update_term_line(lhs: &str, rhs: &str) {
+    let width = terminal_size()
+        .map(|(width, _height)| width.0)
+        .unwrap_or(80);
+    let spc = " ".repeat(usize::from(width) - lhs.chars().count() - rhs.chars().count());
+    print!("\r{lhs}{spc}{rhs}");
+}
+
 /// Run a suite with the specified executor.
 fn run_suite(
     results: &mut ResultFile,
@@ -74,6 +95,8 @@ fn run_suite(
     executor: &Path,
     suite: &Suite,
 ) {
+    hide_cursor();
+    ctrlc::set_handler(show_cursor).ok();
     for (bench_name, bench) in &suite.benchmarks {
         let key = BenchKey {
             benchmark: bench_name.into(),
@@ -82,10 +105,11 @@ fn run_suite(
         };
         let progress = get_progress_percentage(config, *completed_pexecs);
         let eta = get_eta(config, results, *completed_pexecs);
-        print!(
-            ">>> haste: {:3.0}% (ETA {eta}) {key} ...",
-            progress.round() as i64
+        update_term_line(
+            &format!(">>> haste: {key} ..."),
+            &format!("{:3.0}% (ETA {eta})", progress.round() as i64),
         );
+
         for i in 0..(config.proc_execs) {
             io::stdout().flush().ok();
             run_benchmark(
@@ -108,16 +132,21 @@ fn run_suite(
                 .map(|x| format!("{x}ms"))
                 .collect::<Vec<_>>()
                 .join(" ");
-            print!(
-                "\r>>> haste: {:3.0}% (ETA {eta}) {key} {so_far}",
-                progress.round() as i64
-            );
-            if i + 1 < config.proc_execs {
-                print!(" ...");
-            }
+            let lhs = if i + 1 < config.proc_execs {
+                format!(">>> haste: {key} {so_far} ...")
+            } else {
+                format!(">>> haste: {key} {so_far}")
+            };
+            let rhs = if i + 1 < config.proc_execs {
+                format!("{:3.0}% (ETA {eta})", progress.round() as i64)
+            } else {
+                "".to_owned()
+            };
+            update_term_line(&lhs, &rhs);
         }
         println!();
     }
+    show_cursor();
 }
 
 /// Run an individual benchmark.
@@ -150,6 +179,7 @@ fn run_benchmark(
     let Ok(output) = black_box(cmd.output()) else {
         eprintln!("error: failed to spawn benchmark!");
         eprintln!("args: {cmd:?}");
+        show_cursor();
         process::exit(1)
     };
 
@@ -167,6 +197,7 @@ fn run_benchmark(
         eprintln!("--- Begin stderr ---");
         eprint!("{stderr}");
         eprintln!("--- End stderr ---");
+        show_cursor();
         process::exit(1)
     }
 
