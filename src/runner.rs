@@ -80,10 +80,22 @@ fn show_cursor() {
 
 fn update_term_line(lhs: &str, rhs: &str) {
     let width = terminal_size()
-        .map(|(width, _height)| width.0)
+        .map(|(width, _height)| usize::from(width.0))
         .unwrap_or(80);
-    let spc = " ".repeat(usize::from(width) - lhs.chars().count() - rhs.chars().count());
-    print!("\r{lhs}{spc}{rhs}");
+    let lhs_c = lhs.chars().count();
+    let rhs_c = rhs.chars().count();
+    if lhs_c + 1 + rhs_c <= width {
+        let spc = " ".repeat(width - lhs.chars().count() - rhs.chars().count());
+        print!("\r{lhs}{spc}{rhs}");
+    } else if width < rhs_c + 1 {
+        // If the user's got a ludicrously narrow terminal, nothing we do will work very well, so
+        // don't try hard.
+        print!("\r{lhs} {rhs}");
+    } else {
+        // If the terminal is a bit too narrow, chop the LHS down and retain all of the RHS.
+        let lhs_cutdown = lhs.chars().take(width - rhs_c - 1).collect::<String>();
+        print!("\r{lhs_cutdown} {rhs}");
+    }
 }
 
 /// Run a suite with the specified executor.
