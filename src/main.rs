@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use comfy_table::{Cell, CellAlignment, Color, Table};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -11,10 +11,34 @@ use std::{
 mod config;
 mod runner;
 
-/// The z* value used for a 95% confidence interval.
-const CI_ZVAL: f64 = 1.96;
-/// The confidence level of the above, as a percentage.
-const CI_CONF: f64 = 95.;
+#[derive(Copy, Clone, Debug, Default, PartialEq, ValueEnum)]
+enum ConfidenceLevel {
+    #[value(name = "90")]
+    CL90,
+    #[value(name = "95")]
+    CL95,
+    #[default]
+    #[value(name = "99")]
+    CL99,
+}
+
+impl ConfidenceLevel {
+    fn zval(self) -> f64 {
+        match self {
+            Self::CL90 => 1.645,
+            Self::CL95 => 1.96,
+            Self::CL99 => 2.576,
+        }
+    }
+
+    fn as_percent(self) -> u8 {
+        match self {
+            Self::CL90 => 90,
+            Self::CL95 => 95,
+            Self::CL99 => 99,
+        }
+    }
+}
 
 /// The `extra.toml` file for a datum
 #[derive(Default, Serialize, Deserialize)]
@@ -91,7 +115,7 @@ struct ResultFile {
 }
 
 impl ResultFile {
-    fn summarise(&self) -> HashMap<String, SummaryStats> {
+    fn summarise(&self, confidence: ConfidenceLevel) -> HashMap<String, SummaryStats> {
         let mut summaries = HashMap::new();
         for (k, invocs) in &self.data {
             let n = f64::from(u32::try_from(invocs.len()).unwrap());
@@ -102,7 +126,7 @@ impl ResultFile {
             let ci = if invocs.len() > 1 {
                 let variance = invocs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.);
                 let std_dev = variance.sqrt();
-                CI_ZVAL * std_dev / n.sqrt()
+                confidence.zval() * std_dev / n.sqrt()
             } else {
                 // Avoid division by zero in case there is a single sample.
                 // In this case, report a CI of +/- 0.
@@ -246,7 +270,7 @@ impl App {
         println!("haste: created datum {id} {comment_s}");
     }
 
-    fn cmd_diff(&self, id1: usize, id2: usize) {
+    fn cmd_diff(&self, id1: usize, id2: usize, confidence: ConfidenceLevel) {
         let tml1 = fs::read_to_string(self.get_datum_results_path(id1)).unwrap();
         let tml2 = fs::read_to_string(self.get_datum_results_path(id2)).unwrap();
         let data1 = toml::from_str::<ResultFile>(&tml1).unwrap();
@@ -257,8 +281,8 @@ impl App {
             process::exit(1);
         }
 
-        let data1 = data1.summarise();
-        let data2 = data2.summarise();
+        let data1 = data1.summarise(confidence);
+        let data2 = data2.summarise(confidence);
 
         // Compute the formatting of our data.
         let means = data1
@@ -343,7 +367,7 @@ impl App {
             println!("Datum{id2}: {}\n", extra2.comment.unwrap_or(no_comment));
         }
 
-        println!("confidence level: {}%\n", CI_CONF);
+        println!("confidence level: {}%\n", confidence.as_percent());
         println!("{table}");
     }
 
@@ -392,7 +416,13 @@ enum Mode {
     },
     /// Compare two datums.
     #[clap(visible_alias = "d")]
-    Diff { id1: usize, id2: usize },
+    Diff {
+        id1: usize,
+        id2: usize,
+        /// Confidence level for the interval.
+        #[arg(short, long, value_enum, default_value_t = ConfidenceLevel::default())]
+        confidence: ConfidenceLevel,
+    },
     /// List datums.
     #[clap(visible_alias = "l")]
     List,
@@ -403,14 +433,19 @@ fn main() {
     let app = App::new(cli.file);
     match cli.mode {
         Mode::Bench { comment } => app.cmd_bench(comment),
-        Mode::Diff { id1, id2 } => app.cmd_diff(id1, id2),
+        Mode::Diff {
+            id1,
+            id2,
+            confidence,
+        } => app.cmd_diff(id1, id2, confidence),
         Mode::List => app.cmd_list(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{App, DEFAULT_CONFIG_FILE, SummaryStats};
+    use super::{App, ConfidenceLevel, DEFAULT_CONFIG_FILE, SummaryStats};
+    use clap::ValueEnum;
     use std::path::PathBuf;
 
     #[test]
@@ -502,5 +537,26 @@ mod tests {
 
         // Cleanup
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn confidence_level_default() {
+        assert_eq!(ConfidenceLevel::default(), ConfidenceLevel::CL99);
+    }
+
+    #[test]
+    fn confidence_level_from_str() {
+        assert_eq!(
+            ConfidenceLevel::from_str("90", false).unwrap(),
+            ConfidenceLevel::CL90
+        );
+        assert_eq!(
+            ConfidenceLevel::from_str("95", false).unwrap(),
+            ConfidenceLevel::CL95
+        );
+        assert_eq!(
+            ConfidenceLevel::from_str("99", false).unwrap(),
+            ConfidenceLevel::CL99
+        );
     }
 }
