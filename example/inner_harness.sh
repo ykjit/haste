@@ -1,9 +1,15 @@
-#!/bin/sh
+#!/usr/bin/env bash
+#
+# Note: Requires a shell that supports EPOCHREALTIME.
+
+if [ -n "$ZSH_VERSION" ]; then
+    zmodload zsh/datetime
+fi
 
 set -eu
 
 usage() {
-    printf "usage: harness.sh <benchmark> <inproc-iters> <param>\n\n"
+    printf "usage: inner_harness.sh <benchmark> <inproc-iters> <param>\n\n"
     printf "available benchmarks: bigloop"
 }
 
@@ -34,10 +40,20 @@ run() {
     r_inproc_iters=$1; shift
     r_param=$1; shift
 
+    # Start timed section.
+    # In a real experiment, you'd use a reliable monotonic clock.
+    start_s=$EPOCHREALTIME
     while [ "$r_inproc_iters" -ne 0 ]; do
         "$r_bmark" "$r_param"
         r_inproc_iters=$((r_inproc_iters - 1))
     done
+    end_s=$EPOCHREALTIME
+    # End timed section.
+
+    elapsed_ms=$(echo "$end_s * 1000 - $start_s * 1000" | bc)
+
+    # Print the result for the outer harness to scrape.
+    printf "PEXEC_WALLCLOCK_MS %f\n" "$elapsed_ms"
 }
 
 case $bmark in

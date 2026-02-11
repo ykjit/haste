@@ -7,6 +7,8 @@ use std::process::{self, Command, Stdio};
 use std::time::Duration;
 use terminal_size::terminal_size;
 
+const PEXEC_WALLCLOCK_MS: &str = "PEXEC_WALLCLOCK_MS";
+
 fn total_pexecs(config: &Config) -> usize {
     let mut total_pexecs = 0;
     for suite in &config.suites {
@@ -173,10 +175,18 @@ fn run_benchmark(
 ) {
     let harness = suite.harness.to_str().unwrap();
     let inproc_iters = config.inproc_iters.to_string();
-    let mut args = vec![harness, bench_name, &inproc_iters];
+    use tempfile::NamedTempFile;
+    let mut tmpf = NamedTempFile::new().unwrap();
+
+    let mut args = vec![
+        tmpf.path().to_str().unwrap(),
+        executor.to_str().unwrap(),
+        bench_name,
+        &inproc_iters,
+    ];
     args.extend(bench.extra_args.iter().map(String::as_str));
 
-    let mut cmd = Command::new(executor);
+    let mut cmd = Command::new(harness);
     cmd.current_dir(&suite.dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -185,7 +195,6 @@ fn run_benchmark(
     }
     cmd.args(&args);
 
-    let t = std::time::Instant::now();
     // We are careful to use `output()` and not `spawn()` here so as to avoid deadlocks for
     // benchmarks that make a lot of output.
     let Ok(output) = black_box(cmd.output()) else {
@@ -194,8 +203,6 @@ fn run_benchmark(
         show_cursor();
         process::exit(1)
     };
-
-    let elapsed = f64::from(u32::try_from(t.elapsed().as_millis()).unwrap());
 
     if !output.status.success() {
         println!();
@@ -212,6 +219,49 @@ fn run_benchmark(
         show_cursor();
         process::exit(1)
     }
+
+    // Parse the measurements out of the output file.
+    //
+    // For now there should be only a `WALLCLOCK_TIME_MS=x.y` line in there.
+    let mut buf = String::new();
+    use std::io::{Read, Seek};
+    tmpf.as_file_mut()
+        .seek(std::io::SeekFrom::Start(0))
+        .unwrap();
+    tmpf.read_to_string(&mut buf).unwrap();
+    let buf = buf.trim();
+
+    // Note: in error scenarios, we use `tmpf.keep()`, so the user can inspect their broken output
+    // file for debugging purposes.
+    let pth = tmpf.path().to_owned();
+    let elapsed = if let Some((k, v)) = buf.split_once("=") {
+        if k != PEXEC_WALLCLOCK_MS {
+            let _ = tmpf.keep().ok();
+            eprintln!(
+                "failed to find {} key in output file {}",
+                PEXEC_WALLCLOCK_MS,
+                pth.to_str().unwrap()
+            );
+            eprintln!("args: {cmd:?}");
+            std::process::exit(1);
+        }
+        let Ok(v) = v.parse::<f64>() else {
+            let _ = tmpf.keep().ok();
+            eprintln!(
+                "failed to parse {} as a number of milliseconds (from output file {}). ",
+                v,
+                pth.to_str().unwrap()
+            );
+            eprintln!("args: {cmd:?}");
+            std::process::exit(1);
+        };
+        v
+    } else {
+        let _ = tmpf.keep().ok();
+        eprintln!("failed to parse output file: {}", pth.to_str().unwrap());
+        eprintln!("args: {cmd:?}");
+        std::process::exit(1);
+    };
 
     let bench_key = BenchKey {
         benchmark: bench_name.to_owned(),
