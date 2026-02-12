@@ -6,12 +6,12 @@ proc_execs = 3
 inproc_iters = 5
 
 [executors]
-sh = "/bin/sh"
-bash = "/bin/bash"
+bash = "bash"
+zsh = "zsh"
 
 [suites.example]
 dir = "."
-harness = "harness.sh"
+harness = "./outer_harness.sh"
 
 [suites.example.benchmarks.bigloop]
-extra_args = ["100000"]
+extra_args = ["10000"]

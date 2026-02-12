@@ -23,7 +23,7 @@ cargo test --release
 
 # Some very rudimentary checks.
 cd example
-shellcheck harness.sh
+shellcheck *.sh
 cargo run -- b -c first
 cargo run --release -- b -c second
 cargo run --release -- l
