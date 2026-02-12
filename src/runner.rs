@@ -143,7 +143,7 @@ fn run_suite(
                 .get(&key.to_string())
                 .unwrap()
                 .iter()
-                .map(|x| format!("{x}ms"))
+                .map(|x| format!("{x:.0}ms"))
                 .collect::<Vec<_>>()
                 .join(" ");
             let lhs = if i + 1 < config.proc_execs {
