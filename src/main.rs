@@ -149,7 +149,23 @@ impl ResultFile {
         let self_keys: HashSet<&String> = HashSet::from_iter(self.data.keys());
         let other_keys: HashSet<&String> = HashSet::from_iter(other.data.keys());
         if self_keys != other_keys {
-            return Err("results files contain different benchmarks".into());
+            let mut lhs_diff = self_keys
+                .difference(&other_keys)
+                .cloned()
+                .map(|x| x.to_owned())
+                .collect::<Vec<_>>();
+            lhs_diff.sort();
+            let mut rhs_diff = other_keys
+                .difference(&self_keys)
+                .cloned()
+                .map(|x| x.to_owned())
+                .collect::<Vec<_>>();
+            rhs_diff.sort();
+            return Err(format!(
+                "results files contain different benchmarks:\n  lhs lacks: {}\n  rhs lacks: {}",
+                lhs_diff.join(", "),
+                rhs_diff.join(", ")
+            ));
         }
         for (k, v1) in &self.data {
             let v2 = &other.data[k];
