@@ -8,6 +8,7 @@ use std::{
     path::PathBuf,
     process,
 };
+use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
 
 mod config;
 mod runner;
@@ -57,6 +58,7 @@ struct ExtraToml {
     comment: Option<String>,
     executors: IndexMap<String, PathBuf>,
     suite_env: IndexMap<String, HashMap<String, String>>,
+    machine: Option<IndexMap<String, String>>,
 }
 
 fn print_extra(id: usize, extra: &ExtraToml) {
@@ -75,6 +77,37 @@ fn print_extra(id: usize, extra: &ExtraToml) {
             println!("  suite {suite} env {k}={v}");
         }
     }
+}
+
+fn machine_info() -> IndexMap<String, String> {
+    let refresh = RefreshKind::nothing()
+        .with_cpu(CpuRefreshKind::nothing())
+        .with_memory(MemoryRefreshKind::nothing().with_ram());
+    let sys = System::new_with_specifics(refresh).ok();
+    let mut info = IndexMap::new();
+    info.insert("os", System::long_os_version().ok());
+    info.insert(
+        "cpu",
+        sys.as_ref()
+            .and_then(|s| s.cpus().first())
+            .map(|c| c.brand().to_owned())
+            .filter(|b| !b.is_empty()),
+    );
+    info.insert(
+        "memory",
+        sys.as_ref().map(|s| {
+            let mib = u32::try_from(s.total_memory() / 1024 / 1024).unwrap();
+            format!("{:.1} GiB", f64::from(mib) / 1024.)
+        }),
+    );
+    info.insert("arch", Some(System::cpu_arch()));
+    info.insert(
+        "cpu_count",
+        sys.as_ref().map(|s| s.cpus().len().to_string()),
+    );
+    info.into_iter()
+        .filter_map(|(k, v)| Some((k.to_owned(), v?)))
+        .collect()
 }
 
 /// The name of the hidden directory we store state inside.
@@ -270,6 +303,7 @@ impl App {
         comment: Option<String>,
         executors: IndexMap<String, PathBuf>,
         suite_env: IndexMap<String, HashMap<String, String>>,
+        machine: IndexMap<String, String>,
     ) -> usize {
         let id = self.next_id();
         let datum_dir = self.get_datum_dir(id);
@@ -284,6 +318,7 @@ impl App {
             comment,
             executors,
             suite_env,
+            machine: Some(machine),
         })
         .unwrap();
         let extra_path = self.get_datum_extra_path(id);
@@ -317,6 +352,7 @@ impl App {
                 comment: None,
                 executors: IndexMap::new(),
                 suite_env: IndexMap::new(),
+                machine: None,
             }
         }
     }
@@ -352,6 +388,7 @@ impl App {
             comment.to_owned(),
             config.executors.clone(),
             suite_env,
+            machine_info(),
         );
         let comment_s = comment.unwrap_or("".to_owned());
         println!("haste: created datum {id} {comment_s}");
@@ -738,5 +775,29 @@ SOM_LIB = "/opt/Smalltalk"
         assert_eq!(exec_keys, ["csom", "yksom"]);
         assert_eq!(extra.executors["csom"], PathBuf::from("/opt/SOM++"));
         assert_eq!(extra.suite_env["awfy"]["SOM_LIB"], "/opt/Smalltalk");
+        // Datums created before machine info was recorded have no `[machine]` table.
+        assert!(extra.machine.is_none());
+
+        let extra: ExtraToml = toml::from_str(
+            r#"
+[executors]
+[suite_env]
+[machine]
+os = "Linux (Debian GNU/Linux 13)"
+cpu = "Intel(R) Xeon(R) Platinum 8452Y"
+memory = "32 GiB"
+arch = "x86_64"
+cpu_count = "8"
+"#,
+        )
+        .unwrap();
+        let machine = extra.machine.unwrap();
+        let keys: Vec<&str> = machine.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["os", "cpu", "memory", "arch", "cpu_count"]);
+        assert_eq!(machine["os"], "Linux (Debian GNU/Linux 13)");
+        assert_eq!(machine["cpu"], "Intel(R) Xeon(R) Platinum 8452Y");
+        assert_eq!(machine["memory"], "32 GiB");
+        assert_eq!(machine["arch"], "x86_64");
+        assert_eq!(machine["cpu_count"], "8");
     }
 }
