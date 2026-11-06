@@ -7,6 +7,7 @@ use std::{
     env, fmt, fs,
     path::PathBuf,
     process,
+    time::SystemTime,
 };
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
 
@@ -59,6 +60,7 @@ struct ExtraToml {
     executors: IndexMap<String, PathBuf>,
     suite_env: IndexMap<String, HashMap<String, String>>,
     machine: Option<IndexMap<String, String>>,
+    date: Option<String>,
 }
 
 fn print_extra(id: usize, extra: &ExtraToml) {
@@ -304,6 +306,7 @@ impl App {
         executors: IndexMap<String, PathBuf>,
         suite_env: IndexMap<String, HashMap<String, String>>,
         machine: IndexMap<String, String>,
+        date: String,
     ) -> usize {
         let id = self.next_id();
         let datum_dir = self.get_datum_dir(id);
@@ -319,6 +322,7 @@ impl App {
             executors,
             suite_env,
             machine: Some(machine),
+            date: Some(date),
         })
         .unwrap();
         let extra_path = self.get_datum_extra_path(id);
@@ -353,6 +357,7 @@ impl App {
                 executors: IndexMap::new(),
                 suite_env: IndexMap::new(),
                 machine: None,
+                date: None,
             }
         }
     }
@@ -377,6 +382,7 @@ impl App {
             Some(filter) => filter_benchmarks(config, filter),
             None => config,
         };
+        let date = humantime::format_rfc3339_seconds(SystemTime::now()).to_string();
         let results = runner::run(&config, order);
         let suite_env = config
             .suites
@@ -389,6 +395,7 @@ impl App {
             config.executors.clone(),
             suite_env,
             machine_info(),
+            date,
         );
         let comment_s = comment.unwrap_or("".to_owned());
         println!("haste: created datum {id} {comment_s}");
@@ -505,7 +512,8 @@ impl App {
         ids.sort();
         for id in ids {
             let extra = self.load_extra(id);
-            println!("{id:3}: {}", extra.comment.unwrap_or("".into()));
+            let date = extra.date.unwrap_or_default();
+            println!("{id:3}: {date:20} {}", extra.comment.unwrap_or_default());
         }
     }
 }
@@ -777,6 +785,7 @@ SOM_LIB = "/opt/Smalltalk"
         assert_eq!(extra.suite_env["awfy"]["SOM_LIB"], "/opt/Smalltalk");
         // Datums created before machine info was recorded have no `[machine]` table.
         assert!(extra.machine.is_none());
+        assert!(extra.date.is_none());
 
         let extra: ExtraToml = toml::from_str(
             r#"
@@ -799,5 +808,15 @@ cpu_count = "8"
         assert_eq!(machine["memory"], "32 GiB");
         assert_eq!(machine["arch"], "x86_64");
         assert_eq!(machine["cpu_count"], "8");
+
+        let extra: ExtraToml = toml::from_str(
+            r#"
+date = "2009-02-13T23:31:30Z"
+[executors]
+[suite_env]
+"#,
+        )
+        .unwrap();
+        assert_eq!(extra.date.as_deref(), Some("2009-02-13T23:31:30Z"));
     }
 }

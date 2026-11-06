@@ -14,3 +14,4 @@ terminal_size = "0.4.3"
 toml = "0.8.23"
 tempfile = "3.25.0"
 sysinfo = { version = "0.40.1", default-features = false, features = ["system"] }
+humantime = "2.4.0"
